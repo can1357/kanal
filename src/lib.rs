@@ -11,6 +11,8 @@ mod error;
 #[cfg(feature = "async")]
 mod future;
 mod signal;
+#[cfg(test)]
+mod tests;
 
 pub use error::*;
 #[cfg(feature = "async")]
@@ -20,7 +22,7 @@ pub use future::*;
 use core::mem::transmute;
 use core::{
     fmt,
-    mem::{needs_drop, size_of, MaybeUninit},
+    mem::{needs_drop, size_of, ManuallyDrop, MaybeUninit},
     time::Duration,
 };
 use std::time::Instant;
@@ -880,26 +882,27 @@ impl<T> Sender<T> {
             internal.queue.push_back(data.take().unwrap());
             Ok(())
         } else {
-            // send directly to the waitlist
-            let mut d = data.take().unwrap();
-            let sig = Signal::new_sync(KanalPtr::new_from(&mut d));
+            // send directly to the waitlist; once the receiver reads it, it
+            // owns the data, so only a failed send may hand it back
+            let mut d = ManuallyDrop::new(data.take().unwrap());
+            let sig = Signal::new_sync(KanalPtr::new_from(&mut *d));
             internal.push_send(sig.get_terminator());
             drop(internal);
             if !sig.wait_timeout(deadline) {
                 if sig.is_terminated() {
-                    *data = Some(d);
+                    *data = Some(ManuallyDrop::into_inner(d));
                     return Err(SendErrorTimeout::Closed);
                 }
                 {
                     let mut internal = acquire_internal(&self.internal);
                     if internal.cancel_send_signal(&sig) {
-                        *data = Some(d);
+                        *data = Some(ManuallyDrop::into_inner(d));
                         return Err(SendErrorTimeout::Timeout);
                     }
                 }
                 // removing receive failed to wait for the signal response
                 if !sig.wait() {
-                    *data = Some(d);
+                    *data = Some(ManuallyDrop::into_inner(d));
                     return Err(SendErrorTimeout::Closed);
                 }
             }
